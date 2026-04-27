@@ -9,6 +9,7 @@ const BASE_URL = 'https://m.xinbisw.com';
 const BOOK_ID = '22504';
 const INDEX_PATH = `/ml/${BOOK_ID}/`;
 const DELAY_MS = 800; // 每页请求间隔，避免过快
+const PROGRESS_DIR = path.join(__dirname, '.progress');
 
 // ============ 网络请求 ============
 
@@ -187,6 +188,45 @@ function dedup(prevParagraphs, currParagraphs) {
   return currParagraphs.slice(overlapCount);
 }
 
+// ============ 断点续爬 ============
+// 进度文件按 书名 存放在 .progress/ 目录下，与具体网站无关
+// 记录: { bookTitle, outputFile, completedIndex, prevTailParagraphs }
+
+function getProgressFile(bookTitle) {
+  if (!fs.existsSync(PROGRESS_DIR)) fs.mkdirSync(PROGRESS_DIR, { recursive: true });
+  // 用书名做文件名，去除不安全字符
+  const safeName = bookTitle.replace(/[<>:"/\\|?*]/g, '_');
+  return path.join(PROGRESS_DIR, `${safeName}.json`);
+}
+
+function loadProgress(bookTitle) {
+  const file = getProgressFile(bookTitle);
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+function saveProgress(bookTitle, outputFile, completedIndex, prevTailParagraphs) {
+  const file = getProgressFile(bookTitle);
+  const data = {
+    bookTitle,
+    outputFile,
+    completedIndex,
+    // 只保留上一章最后 20 段用于去重，避免进度文件过大
+    prevTailParagraphs: (prevTailParagraphs || []).slice(-20),
+    updatedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+function clearProgress(bookTitle) {
+  const file = getProgressFile(bookTitle);
+  if (fs.existsSync(file)) fs.unlinkSync(file);
+}
+
 // ============ 主流程 ============
 
 async function main() {
@@ -196,12 +236,28 @@ async function main() {
   console.log(`共 ${chapters.length} 章\n`);
 
   const outputFile = path.join(__dirname, `${bookTitle}.txt`);
-  // 清空或创建文件
-  fs.writeFileSync(outputFile, `${bookTitle}\n${'='.repeat(40)}\n\n`, 'utf-8');
 
+  // 尝试加载进度
+  const progress = loadProgress(bookTitle);
+  let startIndex = 0;
   let prevParagraphs = [];
 
-  for (let i = 0; i < chapters.length; i++) {
+  if (progress && progress.completedIndex >= 0) {
+    startIndex = progress.completedIndex + 1;
+    prevParagraphs = progress.prevTailParagraphs || [];
+    console.log(`[断点续爬] 检测到上次进度，从第 ${startIndex + 1} 章继续（已完成 ${startIndex}/${chapters.length}）\n`);
+  } else {
+    // 全新开始，写入文件头
+    fs.writeFileSync(outputFile, `${bookTitle}\n${'='.repeat(40)}\n\n`, 'utf-8');
+  }
+
+  if (startIndex >= chapters.length) {
+    console.log('所有章节已爬取完毕！');
+    clearProgress(bookTitle);
+    return;
+  }
+
+  for (let i = startIndex; i < chapters.length; i++) {
     const ch = chapters[i];
     console.log(`[${i + 1}/${chapters.length}] ${ch.title}`);
 
@@ -218,14 +274,19 @@ async function main() {
 
       prevParagraphs = paragraphs; // 保留原始段落用于下一章去重
 
+      // 每章完成后保存进度
+      saveProgress(bookTitle, outputFile, i, paragraphs);
+
       await sleep(DELAY_MS);
     } catch (err) {
       console.error(`  [错误] ${ch.title}: ${err.message}`);
-      // 出错继续下一章
+      // 出错也保存当前进度（不更新 completedIndex，下次重试该章）
       await sleep(3000);
     }
   }
 
+  // 全部完成，清理进度文件
+  clearProgress(bookTitle);
   console.log(`\n完成！已保存到: ${outputFile}`);
 }
 
